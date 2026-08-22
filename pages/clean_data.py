@@ -585,14 +585,3 @@ DETERMINE THE USER INTENT AND FOLLOW EXACTLY ONE RULE:
                 st.success("✅ Data successfully pushed to 'lumina_enterprise.db' in your project folder!")
             except Exception as e:
                 st.error(f"Database push failed: {e}")
-
-import streamlit as st
-import pandas as pd
-
-# Check if data exists in memory
-if "cleaned_df" in st.session_state:
-    df = st.session_state["cleaned_df"]
-else:
-    # If they haven't uploaded anything yet, tell them to go back
-    st.warning("⚠️ No data found. Please go to the 'Clean Data' page and upload a dataset first.")
-    st.stop() # Stops the rest of the page from running and crashing
