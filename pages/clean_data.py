@@ -323,7 +323,7 @@ st.title("⚡ LUMINA BI: Autonomous Data Engine")
 
 st.sidebar.header("⚙️ Configuration")
 # Hardcoded for a seamless live demo!
-user_api_key = "AQ.Ab8RN6Jj7quI5aXbAAP80138XJo5NdgpF6ld-NfpO9rQLh06Tg" 
+user_api_key = st.secrets["GEMINI_KEY"] 
 gemini_model = DEFAULT_GEMINI_MODEL
 
 # Optional: Add a green checkmark so judges see the engine is connected
