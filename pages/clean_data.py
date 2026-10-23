@@ -140,9 +140,11 @@ def predict_missing_with_llm(df: pd.DataFrame, col_name: str, api_key: str, mode
     category_instruction = ""
     
     if is_text:
-        # Cap at 50 unique categories to prevent blowing up the LLM context window
-        allowed_categories = df[col_name].dropna().unique().tolist()[:50]
-        category_instruction = f"CRITICAL STRICT RULE: For '{col_name}', you MUST choose exactly one of these valid categories: {allowed_categories}. Do NOT invent, format, or hallucinate any other value."
+        existing_values = df[col_name].dropna().unique().tolist()
+        if len(existing_values) <= 50:
+             allowed_categories = existing_values
+             category_instruction = f"CRITICAL STRICT RULE: For '{col_name}', you MUST choose exactly one of these valid categories: {allowed_categories}. Do NOT invent, format, or hallucinate any other value."
+        category_lookup = {str(c).strip().lower(): c for c in allowed_categories}
 
     sample_context = df[safe_cols].dropna(subset=[col_name]).head(5).to_dict(orient="records")
     missing_rows = df.loc[missing_indices, safe_cols].to_dict(orient="records")
@@ -183,10 +185,12 @@ Example format:
             predicted_val = item["predicted_value"]
             
             # NEW 2: Strict output validation
-            if is_text and allowed_categories and predicted_val not in allowed_categories:
-                # If the LLM hallucinated, discard the prediction. 
-                # Lumina BI will safely catch this in the Categorical Fallback ('Unknown') step later.
-                continue
+            if is_text and allowed_categories:
+                # Case/whitespace-insensitive match back to the real category; else discard.
+                matched = category_lookup.get(str(predicted_val).strip().lower())
+                if matched is None:
+                    continue
+                predicted_val = matched
 
             if idx in missing_indices:
                 result[idx] = predicted_val
@@ -256,7 +260,10 @@ def run_cleaning_pipeline(df: pd.DataFrame, api_key: str, model_name: str):
 
     date_columns = [
         col for col in df.columns
-        if "date" in re.split(r"[^a-z0-9]", str(col).lower())
+        if "date" in re.split(
+            r"[^a-z0-9]+",
+            re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col)).lower()
+        )
         and not pd.api.types.is_numeric_dtype(df[col])
     ]
     for date_col in date_columns:
@@ -315,7 +322,7 @@ def run_cleaning_pipeline(df: pd.DataFrame, api_key: str, model_name: str):
         elif col_is_numeric:
             missing_idx = df[df[col].isnull()].index
             valid_data = df[col].dropna()
-            is_pattern = len(valid_data) > 2 and valid_data.diff().std() < 0.05
+            is_pattern = is_arithmetic_sequence(df[col])
 
             if is_pattern:
                 df[col] = df[col].interpolate(method="linear", limit_area="inside")
