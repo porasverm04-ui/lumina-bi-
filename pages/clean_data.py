@@ -43,7 +43,14 @@ def is_id_like(col_name: str, series: pd.Series) -> bool:
     if len(valid) == 0:
         return False
     unique_ratio = series.nunique() / len(valid)
-    name_hit = any(kw in str(col_name).lower() for kw in ID_KEYWORDS)
+    
+    # NEW: Split the column name into distinct words to prevent substring false positives
+    col_name_lower = str(col_name).lower()
+    words = re.split(r'[^a-z0-9]', col_name_lower)
+    
+    # Check if any ID keyword is an exact match for one of the words
+    name_hit = any(kw in words for kw in ID_KEYWORDS)
+    
     return name_hit or unique_ratio > 0.95
 
 def extract_llm_text(response) -> str:
@@ -60,7 +67,7 @@ def extract_llm_text(response) -> str:
 
 def fill_alphanumeric_sequence(series: pd.Series):
     valid_items = series.dropna().astype(str)
-    if len(valid_items) < 2:
+    if len(valid_items) < 3:
         return series, {}
 
     pattern = r"^(.*?)(\d+)$"
@@ -81,6 +88,12 @@ def fill_alphanumeric_sequence(series: pd.Series):
         if match:
             num_series[idx] = int(match.group(2))
 
+    # NEW: Validate that the extracted digits form a stable sequence
+    valid_nums = num_series.dropna()
+    if len(valid_nums) < 3 or valid_nums.diff().std() >= 0.05:
+        # The gaps are irregular (e.g., random phone numbers). Abort interpolation.
+        return series, {}
+
     interpolated = num_series.interpolate(method="linear", limit_area="inside")
     healed = series.copy()
     changes = {}
@@ -93,7 +106,6 @@ def fill_alphanumeric_sequence(series: pd.Series):
             changes[idx] = imputed_str
 
     return healed, changes
-
 def predict_missing_with_llm(df: pd.DataFrame, col_name: str, api_key: str, model_name: str):
     if not api_key or ChatGoogleGenerativeAI is None:
         return {}
@@ -106,15 +118,30 @@ def predict_missing_with_llm(df: pd.DataFrame, col_name: str, api_key: str, mode
     if col_name not in safe_cols:
         safe_cols.append(col_name)
 
+    # NEW 1: Extract valid categories for text columns
+    is_text = is_text_dtype(df[col_name])
+    allowed_categories = []
+    category_instruction = ""
+    
+    if is_text:
+        # Cap at 50 unique categories to prevent blowing up the LLM context window
+        allowed_categories = df[col_name].dropna().unique().tolist()[:50]
+        category_instruction = f"CRITICAL STRICT RULE: For '{col_name}', you MUST choose exactly one of these valid categories: {allowed_categories}. Do NOT invent, format, or hallucinate any other value."
+
     sample_context = df[safe_cols].dropna(subset=[col_name]).head(5).to_dict(orient="records")
     missing_rows = df.loc[missing_indices, safe_cols].to_dict(orient="records")
 
     prompt = f"""
-You are a data imputation model. Target column with missing data: '{col_name}'
+You are a strict data imputation model. Target column with missing data: '{col_name}'
+
+{category_instruction}
+
 Context rows with complete data:
 {json.dumps(sample_context, default=str)}
+
 Rows missing '{col_name}' (identified by index key):
 {json.dumps([{'row_index': idx, 'row_data': row} for idx, row in zip(missing_indices, missing_rows)], default=str)}
+
 Return ONLY a JSON array mapping row_index to the predicted value.
 Example format:
 [
@@ -122,7 +149,7 @@ Example format:
 ]
 """
     try:
-        llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key)
+        llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key, temperature=0.1) # Added low temperature for stability
         response = llm.invoke(prompt)
         raw_text = extract_llm_text(response)
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
@@ -136,8 +163,17 @@ Example format:
                 idx = int(item["row_index"])
             except (TypeError, ValueError):
                 continue
+            
+            predicted_val = item["predicted_value"]
+            
+            # NEW 2: Strict output validation
+            if is_text and allowed_categories and predicted_val not in allowed_categories:
+                # If the LLM hallucinated, discard the prediction. 
+                # Lumina BI will safely catch this in the Categorical Fallback ('Unknown') step later.
+                continue
+
             if idx in missing_indices:
-                result[idx] = item["predicted_value"]
+                result[idx] = predicted_val
         return result
     except Exception as e:
         return {}
@@ -183,7 +219,8 @@ def get_ml_feature_columns(df: pd.DataFrame, target_column: str):
         if pd.api.types.is_datetime64_any_dtype(df[c]):
             dropped.append((c, "datetime column"))
             continue
-        name_hit = any(kw in str(c).lower() for kw in ID_KEYWORDS)
+        col_words = re.split(r"[^a-z0-9]", re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(c)).lower())
+        name_hit = any(kw in col_words for kw in ID_KEYWORDS)
         is_text = is_text_dtype(df[c])
         valid = df[c].dropna()
         near_unique_text = is_text and len(valid) > 0 and df[c].nunique() / len(valid) > 0.95
@@ -201,7 +238,11 @@ def run_cleaning_pipeline(df: pd.DataFrame, api_key: str, model_name: str):
     df = df.copy()
     drop_notes = []
 
-    date_columns = [col for col in df.columns if "date" in col.lower()]
+    date_columns = [
+        col for col in df.columns
+        if "date" in re.split(r"[^a-z0-9]", str(col).lower())
+        and not pd.api.types.is_numeric_dtype(df[col])
+    ]
     for date_col in date_columns:
         df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
 
