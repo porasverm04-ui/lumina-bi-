@@ -43,15 +43,34 @@ def is_id_like(col_name: str, series: pd.Series) -> bool:
     if len(valid) == 0:
         return False
     unique_ratio = series.nunique() / len(valid)
-    
-    # NEW: Split the column name into distinct words to prevent substring false positives
-    col_name_lower = str(col_name).lower()
-    words = re.split(r'[^a-z0-9]', col_name_lower)
-    
-    # Check if any ID keyword is an exact match for one of the words
+
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col_name))  # userId -> user Id
+    words = re.split(r"[^a-z]+", spaced.lower())
     name_hit = any(kw in words for kw in ID_KEYWORDS)
-    
     return name_hit or unique_ratio > 0.95
+    
+def has_id_keyword(col_name) -> bool:
+    """Whole-word match against ID_KEYWORDS.
+
+    'student_id', 'userId', 'Roll No' match; 'width', 'paid_amount', 'provider' do not
+    (the old substring check treated any name containing the letters 'id' as an identifier).
+    """
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col_name))  # userId -> user Id
+    words = re.split(r"[^A-Za-z]+", text.lower())
+    return any(w in ID_KEYWORDS for w in words)
+
+def is_arithmetic_sequence(values: pd.Series) -> bool:
+    """True if the non-null values grow by a (nearly) constant step per ROW.
+
+    The step is measured against row positions, so blanks inside the sequence
+    (1, 2, _, 4) do not break detection. Needs at least 3 known values to judge.
+    """
+    pos = np.flatnonzero(values.notna().to_numpy())
+    if len(pos) < 3:
+        return False
+    vals = values.to_numpy(dtype="float64")[pos]
+    slopes = np.diff(vals) / np.diff(pos)
+    return bool(np.allclose(slopes, np.median(slopes), rtol=0.01, atol=0.05))
 
 def extract_llm_text(response) -> str:
     content = getattr(response, "content", response)
@@ -88,12 +107,9 @@ def fill_alphanumeric_sequence(series: pd.Series):
         if match:
             num_series[idx] = int(match.group(2))
 
-    # NEW: Validate that the extracted digits form a stable sequence
-    valid_nums = num_series.dropna()
-    if len(valid_nums) < 3 or valid_nums.diff().std() >= 0.05:
-        # The gaps are irregular (e.g., random phone numbers). Abort interpolation.
+   
+    if not is_arithmetic_sequence(num_series):
         return series, {}
-
     interpolated = num_series.interpolate(method="linear", limit_area="inside")
     healed = series.copy()
     changes = {}
